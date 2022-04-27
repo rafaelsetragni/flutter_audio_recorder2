@@ -1,12 +1,16 @@
 package com.example.flutter_audio_recorder2;
 
 import android.Manifest;
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Build.VERSION;
 
+import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import android.util.Log;
@@ -16,12 +20,19 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
 
+import io.flutter.embedding.engine.plugins.FlutterPlugin;
+import io.flutter.embedding.engine.plugins.activity.ActivityAware;
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
@@ -30,129 +41,218 @@ import io.flutter.plugin.common.PluginRegistry;
 import io.flutter.plugin.common.PluginRegistry.Registrar;
 
 /** FlutterAudioRecorderPlugin2 */
-public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginRegistry.RequestPermissionsResultListener {
+public class FlutterAudioRecorder2Plugin
+        implements
+          FlutterPlugin,
+          MethodCallHandler,
+          ActivityAware,
+          PluginRegistry.RequestPermissionsResultListener
+{
+  private static final int REQUEST_RECORD_AUDIO_PERMISSION = 200;
+
   private static final String LOG_NAME = "AndroidAudioRecorder";
   private static final int PERMISSIONS_REQUEST_RECORD_AUDIO = 200;
   private static final byte RECORDER_BPP = 16; // we use 16bit
-  private Registrar registrar;
+
+  private MethodChannel pluginChannel;
   private int mSampleRate = 16000; // 16Khz
   private AudioRecord mRecorder = null;
   private String mFilePath;
   private String mExtension;
   private int bufferSize = 1024;
   private FileOutputStream mFileOutputStream = null;
-  private String mStatus = "unset";
+  private RecordingStatus mStatus = RecordingStatus.unset;
   private double mPeakPower = -120;
   private double mAveragePower = -120;
   private Thread mRecordingThread = null;
   private long mDataSize = 0;
-  private Result _result;
+
+  public WeakReference<Context> wContext;
+  public WeakReference<Activity> wActivity;
 
 
-  /** Plugin registration. */
-  public static void registerWith(Registrar registrar) {
-
-    final MethodChannel channel = new MethodChannel(registrar.messenger(), "flutter_audio_recorder2");
-    channel.setMethodCallHandler(new FlutterAudioRecorder2Plugin(registrar));
+  enum RecordingStatus {
+    unset,
+    initialized,
+    recording,
+    paused,
+    stopped
   }
 
-  public FlutterAudioRecorder2Plugin(Registrar registrar) {
-    this.registrar = registrar;
-    this.registrar.addRequestPermissionsResultListener(this);
+  // *****************************          PLUGIN REGISTRATION         ***********************************
+
+  @Override
+  public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
+    pluginChannel = new MethodChannel(binding.getBinaryMessenger(),"flutter_audio_recorder2");
+    pluginChannel.setMethodCallHandler(this);
+
+    Context applicationContext = binding.getApplicationContext();
+    wContext = new WeakReference<>(applicationContext);
+  }
+
+  @Override
+  public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+    pluginChannel.setMethodCallHandler(null);
+    pluginChannel = null;
+    wContext = null;
+  }
+
+  @Override
+  public void onAttachedToActivity(@NonNull ActivityPluginBinding binding) {
+    wActivity = new WeakReference<>(binding.getActivity());
+  }
+
+  @Override
+  public void onDetachedFromActivityForConfigChanges() {
+    wActivity = null;
+  }
+
+  @Override
+  public void onReattachedToActivityForConfigChanges(@NonNull ActivityPluginBinding binding) {
+    wActivity = new WeakReference<>(binding.getActivity());
+  }
+
+  @Override
+  public void onDetachedFromActivity() {
+    wActivity = null;
+  }
+
+  // *****************************          PLUGIN METHODS         ***********************************
+
+  @Override
+  public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
+    // Log.d(LOG_NAME, "calling " + call.method);
+    try {
+      switch (call.method){
+        case "hasPermissions":
+          handleHasPermission(call, result);
+          break;
+        case "init":
+          handleInit(call, result);
+          break;
+        case "current":
+          handleCurrent(call, result);
+          break;
+        case "start":
+          handleStart(call, result);
+          break;
+        case "pause":
+          handlePause(call, result);
+          break;
+        case "resume":
+          handleResume(call, result);
+          break;
+        case "stop":
+          handleStop(call, result);
+          break;
+        default:
+          result.notImplemented();
+          break;
+      }
+    } catch (Exception e) {
+      result.error("Unexpected error", e.getMessage(), null);
+    }
+  }
+
+  // *****************************          PERMISSION METHODS         ***********************************
+
+  private boolean hasRecordPermission(Context context){
+    // if after [Marshmallow], we need to check permission on runtime
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+      return (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+              && (ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED);
+    } else {
+      return ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+  }
+
+  private static final BlockingQueue<Result> _resultsWaitingForPermission = new LinkedBlockingDeque<Result>();
+  private void requestRecordPermission(@NonNull Result result) throws Exception {
+    if (wActivity == null)
+      throw new Exception("Its not possible to request permission without being in an activity");
+
+    Activity activity = wActivity.get();
+    if (activity == null)
+      throw new Exception("Its not possible to request permission without being in an activity");
+
+    _resultsWaitingForPermission.add(result);
+
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+      ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.WRITE_EXTERNAL_STORAGE}, PERMISSIONS_REQUEST_RECORD_AUDIO);
+    } else {
+      ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSIONS_REQUEST_RECORD_AUDIO);
+    }
   }
 
   @Override
   public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-    final int REQUEST_RECORD_AUDIO_PERMISSION = 200;
-    switch (requestCode) {
-      case REQUEST_RECORD_AUDIO_PERMISSION:
-        boolean granted = true;
-        Log.d(LOG_NAME, "parsing result");
-        for (int result : grantResults) {
-          if(result != PackageManager.PERMISSION_GRANTED) {
-            Log.d(LOG_NAME, "result" + result);
-            granted = false;
-          }
-        }
-        Log.d(LOG_NAME, "onRequestPermissionsResult -" + granted);
-        if(_result != null) {
-          _result.success(granted);
-        }
-        return granted;
-        default:
-          Log.d(LOG_NAME, "onRequestPermissionsResult - false");
-          return false;
+    Log.d(LOG_NAME, "parsing result");
+
+    if (requestCode != REQUEST_RECORD_AUDIO_PERMISSION) {
+      Log.d(LOG_NAME, "onRequestPermissionsResult - false");
+      return false;
     }
-  }
 
-  private boolean hasRecordPermission(){
-    // if after [Marshmallow], we need to check permission on runtime
-    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-      return (ContextCompat.checkSelfPermission(registrar.context(), Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
-              && (ContextCompat.checkSelfPermission(registrar.context(), Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED);
-    } else {
-      return ContextCompat.checkSelfPermission(registrar.context(), Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
-    }
-  }
-
-  @Override
-  public void onMethodCall(MethodCall call, Result result) {
-    // Log.d(LOG_NAME, "calling " + call.method);
-    _result = result;
-
-    switch (call.method){
-      case "hasPermissions":
-        handleHasPermission();
+    boolean allPermissionsGranted = false;
+    for (int resultsPosition = 0; resultsPosition < grantResults.length; resultsPosition++) {
+      int grantedResultCode = grantResults[resultsPosition];
+      if (grantedResultCode != PackageManager.PERMISSION_GRANTED) {
+        String permissionName = permissions[resultsPosition];
+        Log.d(LOG_NAME, "Permission not granted: " + permissionName + " - " + grantedResultCode);
         break;
-      case "init":
-        handleInit(call, result);
-        break;
-      case "current":
-        handleCurrent(call, result);
-        break;
-      case "start":
-        handleStart(call, result);
-        break;
-      case "pause":
-        handlePause(call, result);
-        break;
-      case "resume":
-        handleResume(call, result);
-        break;
-      case "stop":
-        handleStop(call, result);
-        break;
-      default:
-        result.notImplemented();
-        break;
-    }
-  }
-
-  private void handleHasPermission(){
-    if(hasRecordPermission()){
-      Log.d(LOG_NAME, "handleHasPermission true");
-      if(_result != null) {
-        _result.success(true);
       }
+      else {
+        allPermissionsGranted = true;
+      }
+    }
+
+    do {
+      try {
+        Result result = _resultsWaitingForPermission.take();
+        Log.d(LOG_NAME, "onRequestPermissionsResult -" + allPermissionsGranted);
+        result.success(allPermissionsGranted);
+      } catch (InterruptedException ignored) {
+      }
+    } while (!_resultsWaitingForPermission.isEmpty());
+
+    return allPermissionsGranted;
+  }
+
+  private void handleHasPermission(@NonNull MethodCall call, @NonNull Result result) throws Exception {
+    if(wContext == null)
+      throw new Exception("Its not possible to request permission without context");
+
+    Context context = wContext.get();
+    if(context == null)
+      throw new Exception("Its not possible to request permission without context");
+
+    if(hasRecordPermission(context)){
+      Log.d(LOG_NAME, "handleHasPermission true");
+      result.success(true);
     } else {
       Log.d(LOG_NAME, "handleHasPermission false");
-
-      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-        ActivityCompat.requestPermissions(registrar.activity(), new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.WRITE_EXTERNAL_STORAGE}, PERMISSIONS_REQUEST_RECORD_AUDIO);
-      } else {
-        ActivityCompat.requestPermissions(registrar.activity(), new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSIONS_REQUEST_RECORD_AUDIO);
-      }
+      requestRecordPermission(result);
     }
-
   }
 
-  private void handleInit(MethodCall call, Result result)  {
+  // *****************************          INITIALIZATION METHODS         ***********************************
+
+  private void handleInit(@NonNull MethodCall call, @NonNull Result result)  {
     resetRecorder();
-    mSampleRate = Integer.parseInt(call.argument("sampleRate").toString());
-    mFilePath = call.argument("path").toString();
-    mExtension = call.argument("extension").toString();
+
+    Integer sampleRateParameter = call.argument("sampleRate");
+    assert sampleRateParameter != null;
+    mSampleRate = sampleRateParameter;
+
+    mFilePath = call.argument("path");
+    assert mFilePath != null;
+
+    mExtension = call.argument("extension");
+    assert mExtension != null;
+
     bufferSize = AudioRecord.getMinBufferSize(mSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-    mStatus = "initialized";
+    mStatus = RecordingStatus.initialized;
+
     HashMap<String, Object> initResult = new HashMap<>();
     initResult.put("duration", 0);
     initResult.put("path", mFilePath);
@@ -160,24 +260,29 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
     initResult.put("peakPower", mPeakPower);
     initResult.put("averagePower", mAveragePower);
     initResult.put("isMeteringEnabled", true);
-    initResult.put("status", mStatus);
+    initResult.put("status", mStatus.name());
+
     result.success(initResult);
   }
 
-  private void handleCurrent(MethodCall call, Result result) {
+  private void handleCurrent(@NonNull MethodCall call, @NonNull Result result) {
     HashMap<String, Object> currentResult = new HashMap<>();
+
     currentResult.put("duration", getDuration() * 1000);
-    currentResult.put("path", (mStatus == "stopped")? mFilePath : getTempFilename());
+    currentResult.put("path", mStatus == RecordingStatus.stopped ? mFilePath : getTempFilename());
     currentResult.put("audioFormat", mExtension);
     currentResult.put("peakPower", mPeakPower);
     currentResult.put("averagePower", mAveragePower);
     currentResult.put("isMeteringEnabled", true);
-    currentResult.put("status", mStatus);
+    currentResult.put("status", mStatus.name());
+
     // Log.d(LOG_NAME, currentResult.toString());
     result.success(currentResult);
   }
 
-  private void handleStart(MethodCall call, Result result) {
+  // *****************************          RECORDING METHODS         ***********************************
+
+  private void handleStart(@NonNull MethodCall call, @NonNull Result result) {
     mRecorder = new AudioRecord(MediaRecorder.AudioSource.MIC, mSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
     try {
       mFileOutputStream = new FileOutputStream(getTempFilename());
@@ -186,7 +291,7 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
       return;
     }
     mRecorder.startRecording();
-    mStatus = "recording";
+    mStatus = RecordingStatus.recording;
     startThread();
     result.success(null);
   }
@@ -201,8 +306,8 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
     mRecordingThread.start();
   }
 
-  private void handlePause(MethodCall call, Result result) {
-    mStatus = "paused";
+  private void handlePause(@NonNull MethodCall call, @NonNull Result result) {
+    mStatus = RecordingStatus.paused;
     mPeakPower = -120;
     mAveragePower = -120;
     mRecorder.stop();
@@ -210,18 +315,18 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
     result.success(null);
   }
 
-  private void handleResume(MethodCall call, Result result) {
-    mStatus = "recording";
+  private void handleResume(@NonNull MethodCall call, @NonNull Result result) {
+    mStatus = RecordingStatus.recording;
     mRecorder.startRecording();
     startThread();
     result.success(null);
   }
 
-  private void handleStop(MethodCall call, Result result) {
-    if(mStatus.equals("stopped")) {
+  private void handleStop(@NonNull MethodCall call, @NonNull Result result) {
+    if (mStatus == RecordingStatus.stopped) {
       result.success(null);
     } else {
-      mStatus = "stopped";
+      mStatus = RecordingStatus.stopped;
 
       // Return Recording Object
       HashMap<String, Object> currentResult = new HashMap<>();
@@ -231,18 +336,20 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
       currentResult.put("peakPower", mPeakPower);
       currentResult.put("averagePower", mAveragePower);
       currentResult.put("isMeteringEnabled", true);
-      currentResult.put("status", mStatus);
+      currentResult.put("status", mStatus.name());
 
 
       resetRecorder();
       mRecordingThread = null;
       mRecorder.stop();
       mRecorder.release();
+
       try {
         mFileOutputStream.close();
       } catch (IOException e) {
         e.printStackTrace();
       }
+
       Log.d(LOG_NAME, "before adding the wav header");
       copyWaveFile(getTempFilename(), mFilePath);
       deleteTempFile();
@@ -258,7 +365,7 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
     int size = bufferSize;
     byte bData[] = new byte[size];
 
-    while (mStatus == "recording"){
+    while (mStatus == RecordingStatus.recording) {
       Log.d(LOG_NAME, "reading audio data");
       mRecorder.read(bData, 0, bData.length);
       mDataSize += bData.length;
@@ -280,8 +387,7 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
   }
 
   private String getTempFilename() {
-    String filepath = mFilePath + ".temp";
-    return filepath;
+    return mFilePath + ".temp";
   }
 
   private void copyWaveFile(String inFilename, String outFilename) {
@@ -385,9 +491,8 @@ public class FlutterAudioRecorder2Plugin implements MethodCallHandler, PluginReg
   private void updatePowers(byte[] bdata){
     short[] data = byte2short(bdata);
     short sampleVal = data[data.length - 1];
-    String[] escapeStatusList = new String[]{"paused", "stopped", "initialized", "unset"};
 
-    if(sampleVal == 0 || Arrays.asList(escapeStatusList).contains(mStatus)){
+    if(sampleVal == 0 || mStatus != RecordingStatus.recording){
       mAveragePower = -120; // to match iOS silent case
     }
     else {
